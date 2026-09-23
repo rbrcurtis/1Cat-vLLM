@@ -110,7 +110,19 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             self._scheduler_mmap = scheduler_mmap
 
             # Create primary tier (CPU-based)
-            assert len(self.gpu_block_size) == 1
+            # Hybrid models (Qwen3.8 is 48 GDN + 16 attention layers) present TWO KV cache
+            # groups, one per layer type. Requiring len(...) == 1 rejected every such model,
+            # even though the rest of the offloading path is group-agnostic: it uses
+            # num_blocks, cpu_page_size_per_worker and block_size_factor, and hash_block_size
+            # is already the GCD of the group sizes (resolve_kv_cache_block_sizes). What the
+            # tiering manager actually needs is a UNIFORM block size across groups, so assert
+            # that instead -- the same check kv_offload/base.py makes for the 'block_size'
+            # extra-config. With --mamba-cache-mode align and mamba-block-size == block-size
+            # the two groups match and the normalized byte buffer is uniform.
+            assert len(set(self.gpu_block_size)) == 1, (
+                "tiered KV offloading needs one block size across KV cache groups, "
+                f"got {self.gpu_block_size}. Set mamba-block-size equal to block-size."
+            )
             primary_tier = CPUPrimaryTierOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
