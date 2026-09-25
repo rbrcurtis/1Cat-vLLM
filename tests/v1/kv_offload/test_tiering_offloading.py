@@ -511,5 +511,104 @@ class TestTieringOffloadingWithoutSecondaryTiers:
         assert count_hits(manager, blocks) == 3
 
 
+class TestPromotionReserve:
+    """The promotion reserve keeps room in the primary tier for reads from a secondary
+    tier, and a promotion that finds no room waits instead of being reported as a
+    cache miss. A miss costs a recompute of the prompt tail; a wait costs a step."""
+
+    def _setup(self, num_blocks: int, reserve: int, max_retries: int = 20):
+        mock_region = _mock_mmap_region(num_blocks)
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=num_blocks, mmap_region=mock_region
+        )
+        secondary_tier = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_region.create_kv_memoryview(),
+            tier_type="example",
+        )
+        manager = TieringOffloadingManager(
+            primary_tier=primary_tier,
+            secondary_tiers=[secondary_tier],
+            promotion_reserve_blocks=reserve,
+            promotion_max_retries=max_retries,
+        )
+        return primary_tier, secondary_tier, manager
+
+    def test_cascade_store_larger_than_the_non_reserved_capacity_is_refused(self):
+        """A cascade may use every primary block but the reserve, and nothing more."""
+        _primary, _secondary, manager = self._setup(num_blocks=5, reserve=2)
+
+        # 5 new blocks into a 5-block primary would leave the reserve empty, and
+        # there is nothing else to evict, so the store is dropped.
+        assert manager.prepare_store(to_keys(range(5)), _CTX) is None
+
+        # 3 blocks fit: 5 - 2 reserved = 3.
+        result = manager.prepare_store(to_keys(range(3)), _CTX)
+        assert result is not None
+        assert len(result.keys_to_store) == 3
+
+    def test_promotion_still_lands_while_a_cascade_is_held_to_the_reserve(self):
+        """Reads keep working once the primary holds its full non-reserved share."""
+        _primary, secondary_tier, manager = self._setup(num_blocks=5, reserve=2)
+
+        stored = to_keys(range(3))
+        assert manager.prepare_store(stored, _CTX) is not None
+        manager.complete_store(stored, _CTX, success=True)
+        list(manager.take_events())
+
+        on_disk = to_keys([9])
+        secondary_tier.blocks[on_disk[0]] = True
+
+        # The primary is at its non-reserved capacity (3 of 5 blocks), so the
+        # promotion has to use the reserve.
+        assert manager.lookup(on_disk[0], _CTX) is None  # promotion initiated
+        list(manager.take_events())  # submit_load
+        list(manager.take_events())  # promotion completes
+
+        assert manager.lookup(on_disk[0], _CTX) is True
+
+    def test_promotion_without_room_waits_then_reports_a_miss(self):
+        """A block that is on disk but cannot be promoted is "retry", not "absent".
+
+        The caller answers "absent" by recomputing that block and every block after
+        it, which is the expensive failure this reserve exists to avoid. The wait is
+        still bounded, so a permanently full primary cannot starve the request.
+        """
+        primary_tier, secondary_tier, manager = self._setup(
+            num_blocks=1, reserve=0, max_retries=2
+        )
+
+        # Fill the only primary block and keep it pinned, as an in-flight cascade
+        # does (prepare_read is what complete_store calls on the cascade path).
+        pinned = to_keys([0])
+        assert manager.prepare_store(pinned, _CTX) is not None
+        manager.complete_store(pinned, _CTX, success=True)
+        primary_tier.prepare_read(pinned, _CTX)
+
+        on_disk = to_keys([7])
+        secondary_tier.blocks[on_disk[0]] = True
+
+        assert manager.lookup(on_disk[0], _CTX) is None  # wait for room
+        assert manager.lookup(on_disk[0], _CTX) is None  # wait for room
+        assert manager.lookup(on_disk[0], _CTX) is False  # give up, caller recomputes
+
+    def test_promotion_without_the_reserve_has_nowhere_to_land(self):
+        """With no reserve the same shape of primary refuses every promotion."""
+        primary_tier, secondary_tier, manager = self._setup(
+            num_blocks=2, reserve=0, max_retries=1
+        )
+
+        stored = to_keys(range(2))
+        assert manager.prepare_store(stored, _CTX) is not None
+        manager.complete_store(stored, _CTX, success=True)
+        primary_tier.prepare_read(stored, _CTX)
+
+        on_disk = to_keys([7])
+        secondary_tier.blocks[on_disk[0]] = True
+
+        assert manager.lookup(on_disk[0], _CTX) is None
+        assert manager.lookup(on_disk[0], _CTX) is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

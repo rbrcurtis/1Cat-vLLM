@@ -155,10 +155,33 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             # Create TieringOffloadingManager. GPU↔CPU transfers use the inherited
             # get_handlers(); secondary tier transfers are handled by the
             # secondary tier managers and need no additional handlers here.
+            #
+            # promotion_reserve_blocks keeps part of the primary tier for reads from
+            # secondary tiers. Without it a cascade store can fill and pin the whole
+            # primary tier, every promotion is then refused, and the caller reads that
+            # refusal as "block not cached anywhere" and recomputes the prompt tail.
+            promotion_reserve = int(
+                self.extra_config.get("promotion_reserve_blocks", 0)
+            )
+            if promotion_reserve < 0 or promotion_reserve >= self.num_blocks:
+                raise ValueError(
+                    "promotion_reserve_blocks must be >= 0 and less than the "
+                    f"primary tier's {self.num_blocks} blocks, got "
+                    f"{promotion_reserve}"
+                )
+            promotion_max_retries = int(
+                self.extra_config.get("promotion_max_retries", 20)
+            )
+            if promotion_max_retries < 0:
+                raise ValueError(
+                    f"promotion_max_retries must be >= 0, got {promotion_max_retries}"
+                )
             tiering_manager = TieringOffloadingManager(
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=enable_events,
+                promotion_reserve_blocks=promotion_reserve,
+                promotion_max_retries=promotion_max_retries,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
@@ -168,9 +191,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
             logger.info(
                 "Created TieringOffloadingManager with primary tier "
-                "(%s, %s blocks) and %s secondary tier(s)",
+                "(%s, %s blocks, %s reserved for promotions) and %s "
+                "secondary tier(s)",
                 self.eviction_policy,
                 self.num_blocks,
+                promotion_reserve,
                 len(secondary_tiers),
             )
 

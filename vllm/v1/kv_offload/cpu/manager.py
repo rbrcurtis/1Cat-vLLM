@@ -144,7 +144,22 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        reserve_blocks: int = 0,
     ) -> PrepareStoreOutput | None:
+        """
+        Store blocks in this tier, evicting as needed.
+
+        Args:
+            keys: Blocks to store.
+            req_context: Per-request context.
+            reserve_blocks: Blocks that must stay free after this store. A
+                tiered setup passes its promotion reserve here on the cascade
+                path, so that a later promotion from a secondary tier always
+                finds room in the primary; promotions themselves pass 0. The
+                store is refused (returns None) when the reserve cannot be
+                honored, and the caller drops those blocks instead of
+                evicting blocks the reserve protects.
+        """
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
         # filter out blocks that are already stored
@@ -157,7 +172,9 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=[],
             )
 
-        num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
+        num_blocks_to_evict = (
+            len(keys_to_store) + reserve_blocks - self._get_num_free_blocks()
+        )
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:

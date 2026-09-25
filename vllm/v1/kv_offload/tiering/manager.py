@@ -16,10 +16,17 @@ Key Design Principles:
    primary tier before GPU can access them
 4. Transparent retry mechanism — Return None from lookup() to signal
    "data is being promoted, try later"
-5. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
+5. Promotion reserve — A cascade store may not consume the last
+   promotion_reserve_blocks of the primary tier, so a promotion from a
+   secondary tier always has somewhere to land. A block that IS on a secondary
+   tier but cannot be promoted yet is reported as "try later" (bounded by
+   promotion_max_retries) rather than "not found": the caller reads "not found"
+   as "not cached anywhere" and recomputes that block and every block after it.
+6. ref_cnt as eviction protection — primary.prepare_read() increments ref_cnt,
    protecting blocks from eviction until complete_read() is called
 """
 
+import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -47,6 +54,11 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 
 logger = init_logger(__name__)
+
+# How often the tiering counters are written to the log. A refused promotion is
+# reported to the scheduler as a cache miss, so the recompute it causes is the
+# only other trace of it.
+_STATS_LOG_INTERVAL_S = 300.0
 
 
 @dataclass
@@ -127,6 +139,8 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
+        promotion_reserve_blocks: int = 0,
+        promotion_max_retries: int = 20,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -136,9 +150,32 @@ class TieringOffloadingManager(OffloadingManager):
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
+            promotion_reserve_blocks: Blocks of the primary tier that cascade
+                stores may not use, kept free for promotions from secondary
+                tiers. 0 disables the reserve.
+            promotion_max_retries: How many consecutive engine steps a request
+                waits for a promotion that has no room yet before the block is
+                reported as not cached. Bounds the wait, so a primary tier that
+                is permanently full cannot starve a request.
         """
+        assert promotion_reserve_blocks >= 0
+        assert promotion_max_retries >= 0
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self.promotion_reserve_blocks = promotion_reserve_blocks
+        self.promotion_max_retries = promotion_max_retries
+
+        # Consecutive promotion refusals per request, cleared when a promotion
+        # lands or the request ends.
+        self._promotion_refusals: dict[str, int] = {}
+
+        # Counters behind the periodic log line.
+        self._secondary_hits = 0
+        self._promotions_started = 0
+        self._promotions_refused = 0
+        self._retries_exhausted = 0
+        self._cascade_stores_dropped = 0
+        self._stats_log_due = time.monotonic() + _STATS_LOG_INTERVAL_S
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -239,9 +276,9 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             True  — block is ready in the primary tier.
             None  — block found but not yet ready (primary in-flight,
-                    promotion started, or a secondary tier is busy).
-            False — block not found in any tier, or primary is full
-                    and cannot accept a promotion.
+                    promotion started, promotion waiting for room).
+            False — block not found in any tier, or a promotion waited longer
+                    than promotion_max_retries.
         """
         self._maybe_process_finished_jobs()
 
@@ -255,8 +292,11 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             result = tier.lookup(key, req_context)
             if result is True:
+                self._secondary_hits += 1
                 if not self._initiate_promotion(tier, key, req_context):
-                    return False  # primary full, block unavailable
+                    return self._promotion_refused(req_context)
+                self._promotions_started += 1
+                self._promotion_refusals.pop(req_context.req_id, None)
                 return None  # promotion started, retry later
             if result is None:
                 any_none = True
@@ -264,6 +304,26 @@ class TieringOffloadingManager(OffloadingManager):
         if any_none:
             return None
         return False
+
+    def _promotion_refused(self, req_context: ReqContext) -> bool | None:
+        """
+        A block is on a secondary tier but the primary tier has no room for it.
+
+        Report "retry later" for the first promotion_max_retries attempts. The
+        in-flight transfers that hold the primary's blocks are short, and waiting
+        one engine step is far cheaper than recomputing the block and everything
+        after it. After that many refusals, fall back to "not found" so that a
+        request cannot wait forever behind a permanently full primary tier.
+        """
+        self._promotions_refused += 1
+        req_id = req_context.req_id
+        refusals = self._promotion_refusals.get(req_id, 0) + 1
+        if refusals > self.promotion_max_retries:
+            self._retries_exhausted += 1
+            self._promotion_refusals.pop(req_id, None)
+            return False
+        self._promotion_refusals[req_id] = refusals
+        return None
 
     def _initiate_promotion(
         self,
@@ -416,10 +476,15 @@ class TieringOffloadingManager(OffloadingManager):
         # Step 2: Store to primary tier (new blocks only).
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
-        # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        # completes. The promotion reserve is held back here: a cascade store
+        # that cannot be honored loses a cache entry, while a promotion that
+        # cannot be placed costs a recompute of the prompt tail.
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, reserve_blocks=self.promotion_reserve_blocks
+        )
 
         if primary_result is None:
+            self._cascade_stores_dropped += 1
             return None
 
         # Step 3: For request-level tiers, cascade blocks already in primary
@@ -552,6 +617,42 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.on_request_finished(req_context)
         self._request_level_tiers.pop(req_context.req_id, None)
+        self._promotion_refusals.pop(req_context.req_id, None)
+
+    def _maybe_log_stats(self) -> None:
+        """Log the promotion counters every few minutes, when any of them moved.
+
+        A refused promotion reaches the caller as a cache miss, so without this
+        line the only trace of the recompute it caused is the prefill itself.
+        """
+        now = time.monotonic()
+        if now < self._stats_log_due:
+            return
+        self._stats_log_due = now + _STATS_LOG_INTERVAL_S
+        if not (
+            self._secondary_hits
+            or self._promotions_started
+            or self._promotions_refused
+            or self._cascade_stores_dropped
+        ):
+            return
+        logger.info(
+            "KV tiering: %d secondary hits, %d promotions started, %d refused "
+            "(%d waited past the %d retry bound), %d cascade stores dropped; "
+            "primary reserve %d blocks",
+            self._secondary_hits,
+            self._promotions_started,
+            self._promotions_refused,
+            self._retries_exhausted,
+            self.promotion_max_retries,
+            self._cascade_stores_dropped,
+            self.promotion_reserve_blocks,
+        )
+        self._secondary_hits = 0
+        self._promotions_started = 0
+        self._promotions_refused = 0
+        self._retries_exhausted = 0
+        self._cascade_stores_dropped = 0
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         """
@@ -575,6 +676,8 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
 
         self._flush_pending_promotions()
+
+        self._maybe_log_stats()
 
         # Reset the per-step gate so next step's first call does real work.
         self._processed_jobs_this_step = False
