@@ -372,6 +372,45 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lookup_gives_up_on_blocks_that_never_arrive(
+    request_runner, async_scheduling: bool
+):
+    """A lookup that cannot become ready must not defer its request forever.
+
+    A load or promotion that never reports completion leaves its keys in flight, and
+    the connector then sees those blocks as ``not ready`` on every step. The scheduler
+    reads a deferred connector result as "ask again later", so without a bound the
+    request is never scheduled and the client hangs until it gives up.
+    """
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+    )
+
+    # Offloaded, but never becoming ready -- what a lost load looks like here.
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, req_context: None
+
+    runner.new_request(token_ids=[0] * offloaded_block_size * 2)
+    req = runner.scheduler.requests[str(runner.req_id)]
+
+    # A fresh wait defers the request once, so the scheduler will ask again.
+    num_matched, _ = runner.connector_scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_matched is None
+
+    # Past the budget the connector answers 0 instead: the request is scheduled and
+    # computes its own prompt, so a block that never arrives cannot hang it.
+    runner.connector_scheduler.max_lookup_defer_s = 0
+    num_matched, _ = runner.connector_scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_matched == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bool):
     block_size = 4
     num_gpu_blocks = 100
