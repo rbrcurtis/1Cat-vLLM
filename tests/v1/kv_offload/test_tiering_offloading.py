@@ -327,11 +327,14 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.submit_store.assert_not_called()
         self.secondary_tier2.submit_store.assert_not_called()
 
-    def test_lookup_batches_submit_load_per_request(self, manager_setup):
-        """lookup() defers submit_load until take_events(), one call per request.
+    def test_lookup_submits_the_promotion_it_started(self, manager_setup):
+        """lookup() submits its promotion immediately, per request.
 
-        Blocks from different requests each get their own submit_load call, each
-        carrying the correct req_context.
+        Submission must not wait for take_events(): that hook runs from
+        update_from_output(), which the engine only reaches when a step produced
+        outputs, and a request waiting for promoted blocks produces none. A promotion
+        queued but never submitted leaves its block in flight (ref_cnt = -1) forever,
+        so every later lookup answers "not ready" and the request stalls.
         """
         blocks = to_keys(range(4))
         for block in blocks:
@@ -350,20 +353,21 @@ class TestTieringOffloadingManager:
         assert self.manager.lookup(blocks[2], ctx_b) is None
         assert self.manager.lookup(blocks[3], ctx_b) is None
 
-        # submit_load must not fire during lookup - only at end of step
-        self.secondary_tier1.submit_load.assert_not_called()
-
-        # simulate end of step
-        list(self.manager.take_events())
-
-        assert self.secondary_tier1.submit_load.call_count == 2
+        # Each lookup submitted the block it queued, with its own request context.
+        assert self.secondary_tier1.submit_load.call_count == 4
         calls = self.secondary_tier1.submit_load.call_args_list
-        jm_a = calls[0].args[0]
-        jm_b = calls[1].args[0]
-        assert set(jm_a.keys) == {blocks[0], blocks[1]}
-        assert jm_a.req_context is ctx_a
-        assert set(jm_b.keys) == {blocks[2], blocks[3]}
-        assert jm_b.req_context is ctx_b
+        assert [set(call.args[0].keys) for call in calls] == [
+            {blocks[0]},
+            {blocks[1]},
+            {blocks[2]},
+            {blocks[3]},
+        ]
+        assert [call.args[0].req_context.req_id for call in calls] == [
+            "req_a",
+            "req_a",
+            "req_b",
+            "req_b",
+        ]
 
     def test_lookup_shared_block_no_duplicate_promotion(self, manager_setup):
         """A block looked up by two requests in the same step is promoted once.

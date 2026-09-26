@@ -269,6 +269,14 @@ class TieringOffloadingManager(OffloadingManager):
             3. On primary miss, query secondary tiers — stop on first
                hit and initiate promotion.
 
+        A promotion started here is submitted before returning, which is what makes a
+        restore happen at all: take_events() also flushes, but it is a per-engine-step
+        hook that is not guaranteed to run while a request waits for blocks, and a
+        promotion that is queued but never submitted leaves its block marked in flight
+        (ref_cnt = -1) forever. Every later lookup then answers "not ready", the request
+        is deferred until it gives up and recomputes, and the allocations made by those
+        dead promotions fill the primary tier until cascade stores are refused too.
+
         Args:
             key: Block hash to look up.
             req_context: Per-request context.
@@ -280,6 +288,13 @@ class TieringOffloadingManager(OffloadingManager):
             False — block not found in any tier, or a promotion waited longer
                     than promotion_max_retries.
         """
+        result = self._lookup_block(key, req_context)
+        self._flush_pending_promotions()
+        return result
+
+    def _lookup_block(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> bool | None:
         self._maybe_process_finished_jobs()
 
         primary_hit = self.primary_tier.lookup(key, req_context)
@@ -377,8 +392,8 @@ class TieringOffloadingManager(OffloadingManager):
     def _flush_pending_promotions(self) -> None:
         """Submit one batched submit_load() per (tier, request).
 
-        Called from take_events() at the end of each engine step, flushing
-        all promotion requests deferred during lookup().
+        Called from lookup() as soon as a promotion is queued, and from take_events()
+        at the end of each engine step for anything still pending.
         """
         if not self._pending_load_submissions:
             return

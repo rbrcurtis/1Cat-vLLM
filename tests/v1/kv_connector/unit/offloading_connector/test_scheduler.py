@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,6 +15,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    MAX_LOOKUP_DEFER_S,
     GroupOffloadConfig,
     OffloadingConnectorScheduler,
     RequestOffloadState,
@@ -394,7 +396,7 @@ def test_lookup_gives_up_on_blocks_that_never_arrive(
     )
 
     # Offloaded, but never becoming ready -- what a lost load looks like here.
-    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, req_context: None
+    runner.manager.lookup.side_effect = lambda key, req_context: None
 
     runner.new_request(token_ids=[0] * offloaded_block_size * 2)
     req = runner.scheduler.requests[str(runner.req_id)]
@@ -677,6 +679,9 @@ def _make_scheduler_with_lookup(
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
+    scheduler.max_lookup_defer_s = MAX_LOOKUP_DEFER_S
+    scheduler._defer_since = {}
+    scheduler._defer_progress = {}
     return scheduler
 
 
@@ -715,6 +720,35 @@ class TestMaximalPrefixLookup:
     def test_none_after_hit_defers(self):
         sched = _make_scheduler_with_lookup({1: True, 2: None})
         assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+
+    def test_exhausted_wait_credits_the_ready_prefix(self):
+        """Past the wait budget, a fetch that never finishes is left behind.
+
+        The blocks that are ready are credited so the request restores them and
+        computes only the rest; answering 0 would discard a prefix that is on disk.
+        """
+        sched = _make_scheduler_with_lookup({1: True, 2: True, 3: None, 4: True})
+        sched.max_lookup_defer_s = 0
+        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX) == 2
+
+    def test_exhausted_wait_with_nothing_ready_misses(self):
+        sched = _make_scheduler_with_lookup({1: None, 2: True})
+        sched.max_lookup_defer_s = 0
+        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 0
+
+    def test_the_wait_restarts_while_blocks_keep_arriving(self):
+        """A restore that is delivering blocks may take longer than one budget."""
+        sched = _make_scheduler_with_lookup({1: True, 2: True, 3: True, 4: None})
+        keys = to_keys([1, 2, 3, 4])
+        # The budget is long expired, but the prefix grew since it started.
+        sched._defer_since[""] = time.monotonic() - 3600
+        sched._defer_progress[""] = 2
+        assert sched._maximal_prefix_lookup(keys, _EMPTY_REQ_CTX) is None
+
+        # No growth this time, so the expired budget runs out: credit what is ready.
+        sched._defer_since[""] = time.monotonic() - 3600
+        sched._defer_progress[""] = 3
+        assert sched._maximal_prefix_lookup(keys, _EMPTY_REQ_CTX) == 3
 
     def test_none_stops_at_miss(self):
         """None is treated as hit for iteration, but miss stops the scan."""

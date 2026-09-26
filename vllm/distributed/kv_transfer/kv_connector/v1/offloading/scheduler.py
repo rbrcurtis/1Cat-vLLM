@@ -41,23 +41,25 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-# How long a lookup may keep deferring a request while it waits for blocks that are
-# already being loaded, or for a promotion to become ready.
+# How long a lookup may wait for blocks that are still being fetched before it gives
+# up on them. The wait is refreshed whenever more of the prefix becomes ready, so this
+# is a no-progress budget: a restore that is delivering blocks may take as long as it
+# needs, while one that has delivered nothing for this long is abandoned.
 #
-# The wait has to be bounded. A load or a promotion that never reports completion --
-# for example because the request that started it was aborted, or because its job was
-# discarded as stale -- leaves its keys marked in flight forever, and every later
-# request that shares those keys is deferred again on every engine step. The scheduler
-# treats a deferred connector result as "ask me again later", so such a request is
-# never scheduled and the client blocks until it gives up: observed as a 113,415-token
-# prompt (56 blocks against a 32-block primary tier) that waited 600 s with
-# num_requests_waiting_by_reason{reason="deferred"} at 1 and kv_cache_usage_perc at 0.
+# The wait has to be bounded at all. A load or a promotion that never reports
+# completion -- for example because the request that started it was aborted, or
+# because its job was discarded as stale -- leaves its blocks marked in flight
+# forever, and the scheduler reads a deferred connector result as "ask me again
+# later", so such a request is never scheduled and the client blocks until it gives
+# up: observed as a 113,415-token prompt (56 blocks against a 32-block primary tier)
+# that waited 600 s with num_requests_waiting_by_reason{reason="deferred"} at 1 and
+# kv_cache_usage_perc at 0.
 #
-# Recomputing is always correct, just slower than reading the blocks back, so a
-# request that has waited this long gives up on the offload and computes its own
-# prompt. A full 160K window is 80 blocks, and the archive reads at ~0.25 s per
-# block, so this leaves room for a whole window to arrive.
-MAX_LOOKUP_DEFER_S: float = 60.0
+# Ten seconds is generous for the work that can actually succeed: the primary tier is
+# a staging area, so a promotion is at most a tier's worth of 64 MiB blocks, and the
+# archive reads at ~0.25 s per block with at most promotion_reserve_blocks in flight.
+# Waiting longer only delays the recompute that follows.
+MAX_LOOKUP_DEFER_S: float = 10.0
 
 
 @dataclass(slots=True)
@@ -335,8 +337,10 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
-        # req_id -> monotonic time of its first deferred lookup, for the bound above
+        # req_id -> (time of its last wait refresh, confirmed tokens then), for the
+        # no-progress budget above
         self._defer_since: dict[ReqId, float] = {}
+        self._defer_progress: dict[ReqId, int] = {}
         self.max_lookup_defer_s: float = MAX_LOOKUP_DEFER_S
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
@@ -381,6 +385,7 @@ class OffloadingConnectorScheduler:
         """Return the number of consecutive offloaded blocks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
+        confirmed = 0
         defer_lookup = False
         for key in keys:
             result = self.manager.lookup(key, req_context)
@@ -389,10 +394,19 @@ class OffloadingConnectorScheduler:
                 # continue lookup to allow manager to kick-off async lookups
                 # for all blocks (until a miss is detected)
                 result = True
+            elif result and not defer_lookup:
+                confirmed += 1
             if not result:
                 break
             hit_count += 1
-        return hit_count if not defer_lookup else None
+        if not defer_lookup:
+            return hit_count
+        if self._keep_deferring(req_context, confirmed):
+            return None
+        # The rest of the prefix is still being fetched and the wait is over, so credit
+        # what is already ready: the request restores that much and computes the rest.
+        # Answering 0 instead would throw away a whole prefix that is on disk.
+        return confirmed
 
     def _sliding_window_lookup(
         self,
@@ -417,8 +431,13 @@ class OffloadingConnectorScheduler:
             else:
                 consecutive_hits += 1
                 if consecutive_hits == sliding_window_size:
-                    return idx + sliding_window_size if not defer_lookup else None
-        return consecutive_hits if not defer_lookup else None
+                    if defer_lookup and self._keep_deferring(req_context, 0):
+                        return None
+                    return idx + sliding_window_size
+        if defer_lookup and self._keep_deferring(req_context, 0):
+            return None
+        # A sliding window is only useful whole, so a partial answer is a miss.
+        return 0 if defer_lookup else consecutive_hits
 
     def _touch(self, req_status: RequestOffloadState):
         for group_config, group_state in zip(
@@ -541,14 +560,11 @@ class OffloadingConnectorScheduler:
                 num_hit_tokens = new_num_hit_tokens
 
         if defer_lookup:
-            if self._keep_deferring(req_status):
-                logger.debug(
-                    "Offloading manager delayed request %s as backend requested",
-                    req_status.req.request_id,
-                )
-                return None
-            # The blocks are not confirmed, so nothing can be credited: recompute.
-            return 0
+            logger.debug(
+                "Offloading manager delayed request %s as backend requested",
+                req_status.req.request_id,
+            )
+            return None
 
         # possibly delay request if any of the hit blocks is already being loaded
         if self._blocks_being_loaded:
@@ -568,19 +584,33 @@ class OffloadingConnectorScheduler:
                 if sliding_window_size_in_blocks is not None:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
                 if any(key in self._blocks_being_loaded for key in offload_keys):
-                    # hit blocks are being loaded, delay request
-                    if self._keep_deferring(req_status):
+                    # Hit blocks are already being loaded by another request.
+                    # Waiting is only a de-duplication: the blocks are ready in
+                    # the primary tier, so loading them again is correct, just
+                    # redundant.
+                    defer_ctx = req_status.req_context
+                    if self._keep_deferring(defer_ctx, num_hit_tokens):
                         logger.debug(
                             "Delaying request %s since some of its"
                             " blocks are already being loaded",
                             req_status.req.request_id,
                         )
                         return None
-                    # Those loads may never finish, and duplicating them is not safe,
-                    # so recompute this prompt instead of waiting for them forever.
-                    return 0
+                    # That load may never report completion (for example because its
+                    # request was aborted), and while its keys stay in the set every
+                    # request that shares them is deferred and then recomputed. Drop the
+                    # stale markers and let this request load them itself.
+                    logger.warning(
+                        "Request %s: %d offloaded tokens have been loading for %.0f s; "
+                        "loading them again",
+                        req_status.req.request_id,
+                        num_hit_tokens,
+                        self.max_lookup_defer_s,
+                    )
+                    self._blocks_being_loaded.difference_update(offload_keys)
+                    return num_hit_tokens
 
-        self._defer_since.pop(req_status.req.request_id, None)
+        self._clear_defer_state(req_status.req.request_id)
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             req_status.req.request_id,
@@ -590,26 +620,37 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens
 
-    def _keep_deferring(self, req_status: RequestOffloadState) -> bool:
-        """Whether this request may wait longer for its offloaded blocks.
+    def _keep_deferring(self, req_context: ReqContext, confirmed: int) -> bool:
+        """Whether to wait longer for offloaded blocks instead of giving up on them.
 
-        False means the wait has run long enough and the request should recompute its
-        prompt rather than keep being deferred; see MAX_LOOKUP_DEFER_S.
+        False means the wait ran MAX_LOOKUP_DEFER_S without more of the prefix becoming
+        ready, so the caller should credit what it has and let the request run;
+        see MAX_LOOKUP_DEFER_S.
         """
-        req_id = req_status.req.request_id
+        req_id = req_context.req_id
         now = time.monotonic()
-        first = self._defer_since.setdefault(req_id, now)
-        waited = now - first
+        if confirmed > self._defer_progress.get(req_id, -1):
+            # Progress: restart the budget, a restore that is working may finish.
+            self._defer_progress[req_id] = confirmed
+            self._defer_since[req_id] = now
+            waited = 0.0
+        else:
+            waited = now - self._defer_since.get(req_id, now)
         if waited < self.max_lookup_defer_s:
             return True
         logger.warning(
-            "Offloaded blocks for request %s have not become ready in %.0f s; "
-            "computing the prompt instead of deferring the request again",
+            "Offloaded blocks for request %s have not become ready in %.0f s "
+            "(%d tokens ready); computing the rest of the prompt",
             req_id,
             waited,
+            confirmed,
         )
-        self._defer_since.pop(req_id, None)
+        self._clear_defer_state(req_id)
         return False
+
+    def _clear_defer_state(self, req_id: ReqId) -> None:
+        self._defer_since.pop(req_id, None)
+        self._defer_progress.pop(req_id, None)
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
@@ -1168,7 +1209,7 @@ class OffloadingConnectorScheduler:
         if req_status is None:
             return False, None
         if not req_status.transfer_jobs:
-            self._defer_since.pop(request.request_id, None)
+            self._clear_defer_state(request.request_id)
             del self._req_status[request.request_id]
             return False, None
         # Pending stores will outlive the request's block ownership.
@@ -1228,6 +1269,7 @@ class OffloadingConnectorScheduler:
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.clear()
         self._defer_since.clear()
+        self._defer_progress.clear()
 
     def shutdown(self) -> None:
         self.manager.shutdown()
