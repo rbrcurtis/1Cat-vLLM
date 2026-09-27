@@ -272,11 +272,16 @@ def _is_sm70_fp8_qpn8_layer(layer: torch.nn.Module) -> bool:
     if suffix not in _SM70_FP8_PREFILL_DENSE_SHAPES | _SM70_FP8_QPN8_EXTRA_SHAPES:
         return False
     n, k = layer.weight.shape
+    # N does not have to be a multiple of the 128-wide block scale. A layer whose
+    # output width is not block aligned (the fused GDN in_proj_qkvz is 4120 rows
+    # per rank at TP4) is padded up to the next block boundary in
+    # process_weights_after_loading and sliced back in apply(), so admission only
+    # needs an alignment the pad can reach.
     return bool(
         k > 0
         and k % 128 == 0
         and n > 0
-        and n % 128 == 0
+        and n % 8 == 0
         and (suffix != "gate_up_proj" or n % 64 == 0)
         and getattr(layer, "input_size_per_partition", 0) == k
         and getattr(layer, "output_size_per_partition", 0) == n
@@ -1136,6 +1141,52 @@ class Fp8LinearMethod(LinearMethodBase):
                 else:
                     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(weight)
                 if not missing_ops and workspace is not None:
+                    logical_n = int(weight.shape[0])
+                    block_n = int(self.weight_block_size[0])
+                    padded_n = (
+                        logical_n
+                        if logical_n % block_n == 0
+                        else (logical_n // block_n + 1) * block_n
+                    )
+                    if padded_n != logical_n:
+                        # The kernel takes block-aligned operands only, so a layer
+                        # whose output width is not a multiple of block_n is
+                        # padded with zero rows and the extra columns are dropped
+                        # in apply(). Zero rows multiply to zero, and the block
+                        # scale covering the partial last block was measured
+                        # before this pad, so the padded columns cannot alter the
+                        # kept ones.
+                        weight = torch.cat(
+                            [
+                                weight,
+                                weight.new_zeros(
+                                    (padded_n - logical_n, weight.shape[1])
+                                ),
+                            ],
+                            dim=0,
+                        ).contiguous()
+                        scale_rows = padded_n // block_n
+                        if weight_scale_inv.shape[0] < scale_rows:
+                            weight_scale_inv = torch.cat(
+                                [
+                                    weight_scale_inv,
+                                    weight_scale_inv.new_zeros(
+                                        (
+                                            scale_rows - weight_scale_inv.shape[0],
+                                            weight_scale_inv.shape[1],
+                                        )
+                                    ),
+                                ],
+                                dim=0,
+                            ).contiguous()
+                        layer.sm70_fp8_qpn8_logical_n = logical_n
+                        layer.sm70_fp8_qpn8_padded_n = padded_n
+                        logger.info_once(
+                            "SM70 QPN8 padded an unaligned output width: "
+                            "%d -> %d rows on one layer.",
+                            logical_n,
+                            padded_n,
+                        )
                     qpn8_codes, qpn8_scales = sm70_ops.fp8_qpn8_prepare_sm70(
                         weight, weight_scale_inv
                     )
@@ -1479,17 +1530,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         out.add_(bias.view(group_count, output_size))
                     return out
 
-                out_shape = (*x.shape[:-1], layer.output_size_per_partition)
+                logical_n = int(layer.output_size_per_partition)
+                compute_n = int(
+                    getattr(layer, "sm70_fp8_qpn8_padded_n", 0) or logical_n
+                )
+                out_shape = (*x.shape[:-1], logical_n)
                 x_2d = x.reshape(-1, x.shape[-1])
                 if x_2d.stride(-1) != 1:
                     x_2d = x_2d.contiguous()
                 out_2d = torch.empty(
-                    (x_2d.shape[0], layer.output_size_per_partition),
+                    (x_2d.shape[0], compute_n),
                     device=x.device,
                     dtype=x.dtype,
                 )
                 if x_2d.shape[0] == 0:
-                    return out_2d.reshape(out_shape)
+                    return out_2d[:, :logical_n].reshape(out_shape)
                 sm70_ops.fp8_qpn8_dispatch_sm70_out(
                     out_2d,
                     int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
@@ -1501,6 +1556,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     bool(layer.sm70_fp8_qpn8_prefetch),
                     False,
                 )
+                if compute_n != logical_n:
+                    # Padded output width: the extra columns are zero and unused.
+                    out_2d = out_2d[:, :logical_n]
                 out = out_2d.reshape(out_shape)
                 if bias is not None:
                     out.add_(bias)

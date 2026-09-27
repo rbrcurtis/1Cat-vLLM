@@ -66,6 +66,24 @@ _ONLINE_MOE_METHODS: dict[QuantKey, type] = {
 }
 
 
+def _sm70_qpn8_available() -> bool:
+    """True when the Volta build carries the packed QPN8 kernels."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 7:
+        return False
+    try:
+        import vllm._C  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70") and hasattr(
+        torch.ops._C, "fp8_qpn8_dispatch_sm70_out"
+    )
+
+
 class OnlineQuantizationConfig(QuantizationConfig):
     """Model-level config for online quantization (quantize fp16/bf16 weights
     during model loading, without requiring a pre-quantized checkpoint)."""
@@ -96,7 +114,15 @@ class OnlineQuantizationConfig(QuantizationConfig):
     def get_min_capability(cls) -> int:
         # Note: as more online quant schemes will be added, this
         # value will become the minimum across all supported schemes.
+        #
+        # Volta is admitted for the blockwise FP8 scheme, because the SM70 build
+        # carries the packed QPN8 kernels (fp8_qpn8_prepare_sm70 and
+        # fp8_qpn8_dispatch_sm70_out) that replace the SM75+ paths. Without those
+        # operators the SM70 route does not exist and the ordinary floor applies.
+        if _sm70_qpn8_available():
+            return 70
         return 75
+
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

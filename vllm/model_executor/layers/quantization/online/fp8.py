@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm import _sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.kernels.linear.scaled_mm import (
@@ -49,10 +50,186 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
+from vllm.utils.torch_utils import direct_register_custom_op
 
 # ---------------------------------------------------------------------------
 # Online FP8 Linear Methods
 # ---------------------------------------------------------------------------
+
+
+def _sm70_qpn8_dispatch(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    """Run the packed kernel with its scratch storage resolved at call time.
+
+    The workspace address must not be captured from the caller: a compiled artifact
+    would freeze a process-local pointer and fail after a restart with "the specified
+    pointer resides on host memory". Resolving it inside this opaque op keeps it out of
+    the graph.
+    """
+    from vllm.model_executor.layers.quantization.fp8 import (
+        _get_sm70_fp8_prefill_exact_dense_workspace,
+    )
+
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is None:
+        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
+    sm70_ops.fp8_qpn8_dispatch_sm70_out(
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )
+
+
+def _sm70_qpn8_dispatch_fake(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "sm70_online_fp8_qpn8_dispatch",
+    _sm70_qpn8_dispatch,
+    mutates_args=["out"],
+    fake_impl=_sm70_qpn8_dispatch_fake,
+)
+
+
+def _sm70_qpn8_available() -> bool:
+    """The Volta packed-kernel route is opt-in and needs its operators."""
+    if not envs.VLLM_SM70_FP8_QPN8:
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 7:
+        return False
+    from vllm.model_executor.layers.quantization.fp8 import (
+        _missing_sm70_fp8_qpn8_ops,
+    )
+
+    return not _missing_sm70_fp8_qpn8_ops()
+
+
+def _sm70_qpn8_prepare(
+    layer: Module, qweight: torch.Tensor, scale: torch.Tensor
+) -> bool:
+    """Repack block-scaled FP8 weights into the SM70 packed QPN8 layout.
+
+    The kernel takes block-aligned operands, so a layer whose output width is not a
+    multiple of the block is padded with zero rows and the extra columns are dropped
+    again in ``_sm70_qpn8_apply``. Zero rows multiply to zero and the block scale that
+    covers the partial last block was measured before the pad, so the padded columns
+    cannot change the kept ones.
+    """
+    if not _sm70_qpn8_available():
+        return False
+    if qweight.dim() != 2 or qweight.shape[1] % 128 != 0:
+        return False
+    if getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "lm_head":
+        return False
+
+    from vllm.model_executor.layers.quantization.fp8 import (
+        _get_sm70_fp8_prefill_exact_dense_workspace,
+        _sm70_fp8_qpn8_config,
+    )
+
+    logical_n = int(qweight.shape[0])
+    block_n = 128  # the block scale grid the kernel is built around
+    padded_n = (
+        logical_n
+        if logical_n % block_n == 0
+        else (logical_n // block_n + 1) * block_n
+    )
+    if padded_n != logical_n:
+        qweight = torch.cat(
+            [qweight, qweight.new_zeros((padded_n - logical_n, qweight.shape[1]))],
+            dim=0,
+        ).contiguous()
+        scale_rows = padded_n // block_n
+        if scale.shape[0] < scale_rows:
+            scale = torch.cat(
+                [
+                    scale,
+                    scale.new_zeros((scale_rows - scale.shape[0], scale.shape[1])),
+                ],
+                dim=0,
+            ).contiguous()
+        layer.sm70_fp8_qpn8_logical_n = logical_n
+        layer.sm70_fp8_qpn8_padded_n = padded_n
+
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(qweight)
+    if workspace is None:
+        return False
+    codes, packed_scale = sm70_ops.fp8_qpn8_prepare_sm70(qweight, scale)
+    split_k, nacc, prefetch = _sm70_fp8_qpn8_config(
+        int(qweight.shape[1]), padded_n, False
+    )
+
+    replace_parameter(layer, "weight", codes)
+    replace_parameter(layer, "weight_scale_inv", packed_scale)
+    layer.sm70_fp8_turbomind = True
+    layer.sm70_fp8_qpn8 = True
+    layer.sm70_fp8_qpn8_split_k = split_k
+    layer.sm70_fp8_qpn8_nacc = nacc
+    layer.sm70_fp8_qpn8_prefetch = prefetch
+    return True
+
+
+def _sm70_qpn8_apply(
+    layer: Module, x: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    if x.dtype != torch.float16:
+        raise RuntimeError(
+            "SM70 FP8 QPN8 requires float16 activations, "
+            f"got {x.dtype}."
+        )
+    logical_n = int(layer.output_size_per_partition)
+    compute_n = int(getattr(layer, "sm70_fp8_qpn8_padded_n", 0) or logical_n)
+    out_shape = (*x.shape[:-1], logical_n)
+    x_2d = x.reshape(-1, x.shape[-1])
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+    out_2d = torch.empty(
+        (x_2d.shape[0], compute_n), device=x.device, dtype=x.dtype
+    )
+    if x_2d.shape[0] == 0:
+        return out_2d[:, :logical_n].reshape(out_shape)
+    torch.ops.vllm.sm70_online_fp8_qpn8_dispatch(
+        out_2d,
+        x_2d,
+        layer.weight,
+        layer.weight_scale_inv,
+        int(layer.sm70_fp8_qpn8_split_k),
+        int(layer.sm70_fp8_qpn8_nacc),
+        bool(layer.sm70_fp8_qpn8_prefetch),
+        False,
+    )
+    if compute_n != logical_n:
+        # Padded output width: the extra columns are zero and unused.
+        out_2d = out_2d[:, :logical_n]
+    out = out_2d.reshape(out_shape)
+    if bias is not None:
+        out.add_(bias)
+    return out
 
 
 class _Fp8OnlineLinearBase(LinearMethodBase):
@@ -249,6 +426,12 @@ class Fp8PerBlockOnlineLinearMethod(_Fp8OnlineLinearBase):
         replace_parameter(layer, "weight", qweight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
 
+        if _sm70_qpn8_prepare(layer, qweight.data, weight_scale_inv.data):
+            # The packed route replaces the generic kernel entirely, and the generic
+            # kernel is where Marlin would otherwise reject an unaligned width.
+            layer._already_called_process_weights_after_loading = True
+            return
+
         self.fp8_linear.process_weights_after_loading(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
@@ -261,6 +444,9 @@ class Fp8PerBlockOnlineLinearMethod(_Fp8OnlineLinearBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.weight_block_size is not None
+
+        if getattr(layer, "sm70_fp8_qpn8", False):
+            return _sm70_qpn8_apply(layer, x, bias)
 
         # Note: batch invariance already handled in the function below
         return self.fp8_linear.apply_weights(

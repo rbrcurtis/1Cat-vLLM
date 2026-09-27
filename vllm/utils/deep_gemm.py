@@ -504,8 +504,11 @@ DEFAULT_BLOCK_SIZE = [128, 128]
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/dd6ed14acbc7445dcef224248a77ab4d22b5f240/deep_gemm/utils/math.py#L38
-@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
-def per_block_cast_to_fp8(
+#
+# The eager body is defined first so that Volta can use it directly. This function
+# contains a cast to float8, and inductor turns that cast into a Triton kernel, which
+# refuses fp8 on SM70. Eager execution runs the same code without the compiled graph.
+def _per_block_cast_to_fp8_eager(
     x: torch.Tensor, block_size: list[int] = DEFAULT_BLOCK_SIZE, use_ue8m0: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_dtype = current_platform.fp8_dtype()
@@ -525,6 +528,21 @@ def per_block_cast_to_fp8(
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
         x_view.size(0), x_view.size(2)
     )
+
+
+def _volta_needs_eager_fp8_cast() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major < 8
+
+
+if _volta_needs_eager_fp8_cast():
+    per_block_cast_to_fp8 = _per_block_cast_to_fp8_eager
+else:
+    per_block_cast_to_fp8 = torch.compile(
+        dynamic=True, backend=current_platform.simple_compile_backend
+    )(_per_block_cast_to_fp8_eager)
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
