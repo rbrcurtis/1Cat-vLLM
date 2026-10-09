@@ -30,8 +30,6 @@ This public mirror (**rbrcurtis**) carries additional work on top of upstream, b
 
 ---
 
-## Make Volta Fast Again
-
 > Tesla V100 was released in 2017.
 >
 > Its Tensor Cores did not suddenly become useless.
