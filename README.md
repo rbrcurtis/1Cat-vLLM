@@ -17,6 +17,8 @@
 
 <strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
+> Measured results from a 4× V100 32GB PCIe box (Qwen3.8-27B, 8-bit weights, fp8 KV, no NVLink): [`benchmarks/v100-qwen38/`](benchmarks/v100-qwen38/)
+
 > Tesla V100 was released in 2017.
 >
 > Its Tensor Cores did not suddenly become useless.
