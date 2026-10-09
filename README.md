@@ -17,7 +17,20 @@
 
 <strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
-> Measured results from a 4× V100 32GB PCIe box (Qwen3.8-27B, 8-bit weights, fp8 KV, no NVLink): [`benchmarks/v100-qwen38/`](benchmarks/v100-qwen38/)
+> Measured results from a 4× V100 32GB PCIe box (Qwen3.8-27B, 8-bit weights, fp8 KV, no NVLink) are in this mirror — see below.
+
+## Contributions in this mirror
+
+This public mirror (**rbrcurtis**) carries additional work on top of upstream, built and measured on a 4× V100 32GB PCIe box (Threadripper 2990WX / ASRock X399 Taichi, mixed x8/x16 PCIe, two NUMA islands, no NVLink):
+
+- **8-bit block-FP8 weights on SM70 (QPN8).** Online 128×128 block-FP8 quantization executed through the SM70 packed kernel: the quantizer capability floor accepts 70 when the packed kernel is present, odd-width layers (4,120 rows at TP4) are zero-padded to the kernel's 128-row block and sliced back after the matmul, one compiled block-cast runs eagerly because the compiler backend refuses FP8 on Volta, and the per-block linear path repacks into the packed layout at load. [`678ade4`](https://github.com/rbrcurtis/1Cat-vLLM/commit/678ade422). Qwen3.8-27B weights drop from 14.28 → 7.34 GiB per card; single-session decode rises from 31.8 → 46.2 tok/s; full-window concurrency from 5 → 9 sessions.
+- **Tiered KV offload.** Four fixes so the disk-KV archive runs on the hybrid GDN/full-attention coder model and holds long windows: accept hybrid models in the tiering spec ([`485c83d`](https://github.com/rbrcurtis/1Cat-vLLM/commit/485c83df9)), keep room in the primary tier for promotions ([`1b8f49f`](https://github.com/rbrcurtis/1Cat-vLLM/commit/1b8f49ff0)), bound deferred lookups so a request cannot hang ([`79e42b7`](https://github.com/rbrcurtis/1Cat-vLLM/commit/79e42b712)), submit promotions from lookup and credit partial prefixes ([`6c60d36`](https://github.com/rbrcurtis/1Cat-vLLM/commit/6c60d3675)).
+- **NCCL link classification on a mixed-width host.** `NCCL_P2P_LEVEL=SYS` — NCCL's default ring refused to treat the cross-island PCIe links as direct peer links even though peer access works. Standalone 21 MB all-reduce: 13.3 → 5.67 ms; live prefill: 913 → 1,583 tok/s. Documented in [`benchmarks/v100-qwen38/`](benchmarks/v100-qwen38/).
+- **Measured results, 8-bit Qwen3.8-27B at TP4:** 46.2 tok/s single-stream decode, 200.2 tok/s aggregate across eight concurrent sessions, 1,211–1,672 tok/s prefill from 32k to 200k context. Structured results and the benchmark clients: [`benchmarks/v100-qwen38/`](benchmarks/v100-qwen38/). Write-up: [Four 2017 V100s, One Fork, and a 27B Model That Refused to Fit](https://www.clankwrangler.com/blog/20).
+
+---
+
+## Make Volta Fast Again
 
 > Tesla V100 was released in 2017.
 >
