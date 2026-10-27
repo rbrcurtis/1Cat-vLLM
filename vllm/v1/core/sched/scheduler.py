@@ -43,6 +43,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.kv_offload.tiering.reachability import log_chain
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -2141,6 +2142,15 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            # Archive reachability bookkeeping: record this request's prompt
+            # block-hash chain so the disk archive can pin the newest chain per
+            # session instead of evicting by age. No-op unless
+            # KV_ARCHIVE_CHAIN_LOG is set and the request carries the tag.
+            log_chain(
+                request.request_id,
+                request.num_prompt_tokens,
+                request.block_hashes,
+            )
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:

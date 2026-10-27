@@ -47,6 +47,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.tiering.reachability import archive_session_for
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
@@ -211,6 +212,17 @@ class TieringOffloadingManager(OffloadingManager):
         self._job_id_counter += 1
         return job_id
 
+    @staticmethod
+    def _archive_allowed(req_context: ReqContext | None) -> bool:
+        """Whether this request's blocks may be written to persistent tiers.
+
+        Only tagged (pi) traffic is archived, so the disk archive contains
+        nothing but blocks a session can later claim. Session-id parsing lives
+        in ``reachability.archive_session_for``; the tag prefix defaults to
+        ``pi-`` and is set with VLLM_KV_ARCHIVE_TAG_PREFIX.
+        """
+        return archive_session_for(getattr(req_context, "req_id", None)) is not None
+
     def _maybe_process_finished_jobs(self):
         """
         Poll secondary tiers for completed jobs (at most once per step).
@@ -311,6 +323,11 @@ class TieringOffloadingManager(OffloadingManager):
                 if not self._initiate_promotion(tier, key, req_context):
                     return self._promotion_refused(req_context)
                 self._promotions_started += 1
+                logger.debug(
+                    "Promotion started for request %s from %s.",
+                    req_context.req_id,
+                    type(tier).__name__,
+                )
                 self._promotion_refusals.pop(req_context.req_id, None)
                 return None  # promotion started, retry later
             if result is None:
@@ -336,8 +353,22 @@ class TieringOffloadingManager(OffloadingManager):
         if refusals > self.promotion_max_retries:
             self._retries_exhausted += 1
             self._promotion_refusals.pop(req_id, None)
+            logger.warning(
+                "Request %s waited %d attempts for a promotion; the primary tier "
+                "stayed full, so the block reports as a miss and the prompt tail "
+                "is recomputed.",
+                req_id,
+                self.promotion_max_retries,
+            )
             return False
         self._promotion_refusals[req_id] = refusals
+        logger.debug(
+            "Promotion refused for request %s: no room in the primary tier "
+            "(attempt %d of %d).",
+            req_id,
+            refusals,
+            self.promotion_max_retries,
+        )
         return None
 
     def _initiate_promotion(
@@ -500,6 +531,13 @@ class TieringOffloadingManager(OffloadingManager):
 
         if primary_result is None:
             self._cascade_stores_dropped += 1
+            logger.debug(
+                "Cascade store dropped for request %s: the primary tier could "
+                "not take %d blocks with %d held back for promotions.",
+                req_context.req_id,
+                len(keys),
+                self.promotion_reserve_blocks,
+            )
             return None
 
         # Step 3: For request-level tiers, cascade blocks already in primary
@@ -531,6 +569,8 @@ class TieringOffloadingManager(OffloadingManager):
             k for k in keys if self.primary_tier.lookup(k, req_context) is True
         )
         if not ready_keys:
+            return
+        if not self._archive_allowed(req_context):
             return
 
         for tier in request_level_tiers:
@@ -586,6 +626,14 @@ class TieringOffloadingManager(OffloadingManager):
         # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
         # eviction during the async transfer). One prepare_read() call per
         # secondary tier.
+        # Persistent (disk) tiers only accept tagged traffic: the archive is
+        # session-scoped and garbage-collected by reachability of a session's
+        # newest prompt chain, so untagged requests would only write blocks no
+        # session can ever claim. The CPU primary tier still holds them, so
+        # nothing is recomputed while the engine lives.
+        if not self._archive_allowed(req_context):
+            return
+
         for tier in self.secondary_tiers:
             primary_blocks_spec = self.primary_tier.prepare_read(keys, req_context)
 

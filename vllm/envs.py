@@ -4100,6 +4100,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY": lambda: os.getenv(
         "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""
     ),
+    # KV archive reachability (1Cat fork). The tiered offload archive is
+    # content-addressed and append-only, so a prompt that rewrites its own
+    # middle (compaction) forks the block-hash chain and orphans the previous
+    # branch. Only requests whose id starts with the tag prefix are written to
+    # persistent tiers, and each tagged request appends its prompt block-hash
+    # chain to the chain log, which the archive GC reads to pin a session's
+    # newest chain instead of evicting by age.
+    "VLLM_KV_ARCHIVE_TAG_PREFIX": lambda: os.environ.get(
+        "VLLM_KV_ARCHIVE_TAG_PREFIX", "pi-"
+    ),
+    "VLLM_KV_ARCHIVE_CHAIN_LOG": lambda: os.environ.get(
+        "VLLM_KV_ARCHIVE_CHAIN_LOG", ""
+    ),
     # Whether to use S3 path for model loading in CI via RunAI Streamer
     "VLLM_CI_USE_S3": lambda: os.environ.get("VLLM_CI_USE_S3", "0") == "1",
     # Use model_redirect to redirect the model name to a local folder.
