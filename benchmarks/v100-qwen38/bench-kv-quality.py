@@ -18,7 +18,7 @@ wrong and the long result means nothing.
 
 Run it with the engine's venv, because that is where the tokenizer lives:
   HF_HUB_OFFLINE=1 /home/ryan/Code/1Cat-vLLM/.venv/bin/python bench-kv-quality.py \
-      --tokens 200000 --model-path /mnt/E/models/qwen3.8-27b-fp8 --out /tmp/kvq-4bitnc.json
+      --tokens 200000 --model-path /mnt/D/models/qwen3.8-27b-fp8 --out /tmp/kvq-4bitnc.json
 """
 import argparse
 import json
@@ -89,7 +89,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=200000)
     ap.add_argument("--url", default="http://127.0.0.1:18080")
     ap.add_argument("--model", default="qwen3.8-27b")
-    ap.add_argument("--model-path", default="/mnt/E/models/qwen3.8-27b-fp8",
+    ap.add_argument("--model-path", default="/mnt/D/models/qwen3.8-27b-fp8",
                     help="tokenizer source; use the checkpoint the engine serves")
     ap.add_argument("--max-tokens", type=int, default=300)
     ap.add_argument("--out", default=None, help="write the full answer and score to this JSON")

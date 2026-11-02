@@ -25,7 +25,7 @@ import time
 import requests
 from transformers import AutoTokenizer
 
-MODEL_PATH = "/mnt/E/models/qwen3.8-27b-nvfp4"
+MODEL_PATH = "/mnt/D/models/qwen3.8-27b-nvfp4"
 
 BASE = (
     "Paged attention stores the key and value tensors of a sequence in fixed size blocks, so a "
